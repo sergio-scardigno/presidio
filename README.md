@@ -47,14 +47,32 @@ La primera ejecución carga los modelos y puede tardar. Al terminar muestra cuá
 | Opción | Efecto |
 |---|---|
 | `--idioma es` o `--idioma en` | Idioma del texto. Por defecto, español. |
-| `--modo reemplazar` | Sustituye por `<PERSON>`, `<DATE_TIME>`, etc. Es el modo por defecto. |
+| `--modo reemplazar` | Sustituye por etiquetas descriptivas en español (`<PERSONA>`, `<DIRECCION>`, `<LUGAR>`, `<DNI>`, etc.). Modo por defecto. |
 | `--modo mascara` | Cubre el dato con asteriscos. |
 | `--modo hash` | Lo sustituye por un hash SHA-256. |
 | `--modo borrar` | Lo elimina. |
-| `--seudonimos` | El mismo valor recibe siempre el mismo sustituto (`PERSON_1`, `EMAIL_ADDRESS_3`). |
+| `--seudonimos` | Numera cada entidad (`<PERSONA_1>`, `<DNI_1>`, `<TELEFONO_1>`, `<DIRECCION_1>`) con la misma etiqueta en todo el documento: reconoce el apellido suelto, nombres sin tilde y DNI o teléfonos escritos con otro formato. Guarda `archivo.mapa.json`. |
+| `--desanonimizar resp.txt` | Restaura los datos reales en un texto (ej. respuesta de la IA) usando `--mapa`. |
+| `--mapa archivo.mapa.json` | Ruta al mapa de equivalencias generado por `--seudonimos`. |
 | `--umbral 0.35` | Confianza mínima, de 0 a 1. Un valor más alto detecta menos. |
 | `--columnas a,b,c` | En CSV o Excel, analiza solo esas columnas. |
 | `--ocultar-columnas a,b` | Sustituye la columna entera sin analizarla. |
+
+### Flujo con Inteligencia Artificial (LLM)
+
+1. **Anonimizar el documento diferenciando personas y domicilios:**
+   ```powershell
+   python anonimizar.py input\contrato.docx --seudonimos
+   ```
+   Genera `output\contrato.docx` (con `<PERSONA_1>`, `<PERSONA_2>`, `<DIRECCION_1>`) y `output\contrato.mapa.json`.
+
+2. **Enviar el texto anonimizado a la IA** para su análisis o redacción.
+
+3. **Restaurar los datos reales en la respuesta de la IA:**
+   ```powershell
+   python anonimizar.py --desanonimizar respuesta_ia.txt --mapa output\contrato.mapa.json
+   ```
+   Crea `respuesta_ia.restaurado.txt` con los nombres y domicilios reales restituidos.
 
 Ejemplo para un CSV con documento y CUIL en columnas propias:
 
