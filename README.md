@@ -52,16 +52,16 @@ La primera ejecución carga los modelos y puede tardar. Al terminar muestra cuá
 | `--modo hash` | Lo sustituye por un hash SHA-256. |
 | `--modo borrar` | Lo elimina. |
 | `--seudonimos` | Numera cada entidad (`<PERSONA_1>`, `<DNI_1>`, `<TELEFONO_1>`, `<DIRECCION_1>`) con la misma etiqueta en todo el documento: reconoce el apellido suelto, nombres sin tilde y DNI o teléfonos escritos con otro formato. Guarda `archivo.mapa.json`. |
-| `--desanonimizar resp.txt` | Restaura los datos reales en un texto (ej. respuesta de la IA) usando `--mapa`. |
+| `--desanonimizar resp.txt` | Restaura los datos reales en un texto (ej. una respuesta recibida) usando `--mapa`. |
 | `--mapa archivo.mapa.json` | Ruta al mapa de equivalencias generado por `--seudonimos`. |
 | `--sellos` | En PDF de escrituras, tapa los sellos del escribano (el OCR no lee su nombre). |
 | `--umbral 0.35` | Confianza mínima, de 0 a 1. Un valor más alto detecta menos. |
 | `--columnas a,b,c` | En CSV o Excel, analiza solo esas columnas. |
 | `--ocultar-columnas a,b` | Sustituye la columna entera sin analizarla. |
 
-### Usar el documento en un chat de IA sin exponer los datos
+### Compartir el documento sin exponer los datos
 
-El programa no se conecta a ninguna IA: todo corre en tu computadora. Este es el uso previsto para consultar un chat (ChatGPT, Claude, Gemini u otro) sin pasarle datos personales:
+El programa no se conecta a ningún servicio externo: todo corre en tu computadora. Este es el uso previsto para compartir un documento con un servicio o una persona externa sin pasarle datos personales:
 
 1. **Anonimizá el documento con etiquetas numeradas:**
    ```powershell
@@ -69,7 +69,7 @@ El programa no se conecta a ninguna IA: todo corre en tu computadora. Este es el
    ```
    Genera `output\contrato.docx` (con `<PERSONA_1>`, `<DNI_1>`, `<DIRECCION_1>`...) y `output\contrato.mapa.json`, que guarda a qué dato real corresponde cada etiqueta. El mapa no se comparte.
 
-2. **Copiá el texto anonimizado al chat** y pedí lo que necesites (revisión, resumen, redacción). La IA solo ve las etiquetas.
+2. **Compartí el texto anonimizado** y pedí lo que necesites (revisión, resumen, redacción). Quien lo recibe solo ve las etiquetas.
 
 3. **Guardá la respuesta en un `.txt` y restaurá los datos reales:**
    ```powershell
