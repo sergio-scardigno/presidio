@@ -11,6 +11,7 @@ Opciones:
     --seudonimos                 numera cada entidad (<PERSONA_1>, <DNI_1>...) igual en todo el documento y guarda .mapa.json
     --desanonimizar archivo.txt  restaura los datos reales en un texto usando un mapa de equivalencias
     --mapa archivo.mapa.json     archivo con el glosario de correspondencias para --desanonimizar
+    --sellos                     (PDF) tapa los sellos del escribano en hojas de protocolo notarial
     --umbral 0.35                confianza mínima (0-1)
     --columnas a,b,c             (CSV/XLSX) solo analiza estas columnas
     --ocultar-columnas a,b       (CSV/XLSX) sustituye la columna entera sin analizarla
@@ -589,6 +590,20 @@ class Anonimizador:
                     continue
                 candidatos.append(RecognizerResult(etype, m.start(), m.end(), 1.0))
 
+        # Organizaciones: el OCR suele deformar el nombre ("GRUPO RNEAZZO S.R.I."), se compara aproximado
+        tokens = [m.span() for m in re.finditer(r"\S+", texto)]
+        for c in self.clusters.get("ORGANIZATION", []):
+            for v in c["variants"]:
+                n = len(v.split())
+                if n < 2:
+                    continue
+                for k in range(len(tokens) - n + 1):
+                    ini, fin = tokens[k][0], tokens[k + n - 1][1]
+                    ventana = texto[ini:fin].strip("\"'“”.,;:")
+                    if sim(ventana, v) >= 0.75:
+                        ini, fin = recortar_bordes(texto, ini, fin)
+                        candidatos.append(RecognizerResult("ORGANIZATION", ini, fin, 0.9))
+
         # Una aparición conocida más larga reemplaza a detecciones parciales que contiene
         # (ej. el modelo vio solo "Gomez" en "María Laura Gomez")
         actuales = list(resultados)
@@ -935,6 +950,30 @@ def tapar(dibujo, palabras, resultado, etiqueta, papel, cache):
         dibujo.text((x0 + 2, y0 + max(0, (y1 - y0 - alto) / 2) - caja[1]), etiqueta, fill="black", font=letra)
 
 
+# Hoja de protocolo notarial: el sello del escribano va arriba a la derecha, sobre el número de folio
+ZONA_SELLO_PROTOCOLO = (0.63, 0.085, 0.84, 0.18)  # fracciones de ancho y alto de la página
+# Texto que el OCR alcanza a leer de un sello redondo (en mayúsculas, a diferencia del cuerpo)
+TEXTO_SELLO = re.compile(r"(?:ES)?C?RIBAN[OA]S?|MAT\.?")
+
+
+def zonas_sello(ancho, alto, palabras):
+    """Recuadros que tapan los sellos del escribano, cuyo nombre el OCR no puede leer."""
+    x0, y0, x1, y1 = ZONA_SELLO_PROTOCOLO
+    zonas = [(x0 * ancho, y0 * alto, x1 * ancho, y1 * alto)]
+    d = 0.24 * ancho  # diámetro aproximado de un sello redondo
+    for p in palabras:
+        if not TEXTO_SELLO.fullmatch(p["text"]):
+            continue
+        b = p["box"]
+        cx = b["x"] + b["width"] / 2
+        if p["text"].startswith("MAT"):
+            cy = b["y"] + b["height"] / 2
+        else:  # "ESCRIBANO" va en el borde inferior del sello
+            cy = b["y"] + b["height"] - d / 2
+        zonas.append((cx - d / 2, cy - d / 2, cx + d / 2, cy + d / 2 + b["height"]))
+    return zonas
+
+
 def es_ruido(linea):
     if re.fullmatch(r"A\s+<PHONE_NUMBER>", linea):
         return True
@@ -1036,7 +1075,7 @@ def paginas_a_markdown(paginas, nombre):
     return "\n".join(partes).strip() + "\n"
 
 
-def procesar_pdf(entrada, salida, anon):
+def procesar_pdf(entrada, salida, anon, sellos=False):
     origen = pymupdf.open(entrada)
     destino = pymupdf.open()
     paginas_info = []
@@ -1069,6 +1108,10 @@ def procesar_pdf(entrada, salida, anon):
         for r in resultados:
             valor = crudo[r.start:r.end]
             tapar(dibujo, palabras, r, anon.etiqueta(r.entity_type, valor), papel, cache)
+
+        if sellos:
+            for zona in zonas_sello(imagen.width, imagen.height, palabras):
+                dibujo.rectangle(zona, fill=papel)
 
         buffer = io.BytesIO()
         imagen.save(buffer, format="JPEG", quality=80)
@@ -1140,7 +1183,7 @@ def procesar(entrada, salida, anon, args):
     elif ext == ".docx":
         procesar_docx(entrada, salida, anon)
     elif ext == ".pdf":
-        procesar_pdf(entrada, salida, anon)
+        procesar_pdf(entrada, salida, anon, getattr(args, "sellos", False))
     else:
         print(f"  Formato no soportado, se omite: {entrada.name}")
         return
@@ -1158,6 +1201,7 @@ def main():
     ap.add_argument("--seudonimos", action="store_true", help="diferencia entidades individualmente (<PERSONA_1>, <DIRECCION_1>...) y guarda .mapa.json")
     ap.add_argument("--desanonimizar", type=Path, help="archivo de texto (ej. respuesta de la IA) a restaurar con datos reales")
     ap.add_argument("--mapa", type=Path, help="archivo .mapa.json con equivalencias para desanonimizar")
+    ap.add_argument("--sellos", action="store_true", help="(PDF) tapa los sellos del escribano en hojas de protocolo notarial")
     ap.add_argument("--umbral", type=float, default=0.35)
     ap.add_argument("--columnas", type=lista, default=set())
     ap.add_argument("--ocultar-columnas", type=lista, default=set())

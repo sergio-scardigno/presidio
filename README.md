@@ -54,6 +54,7 @@ La primera ejecución carga los modelos y puede tardar. Al terminar muestra cuá
 | `--seudonimos` | Numera cada entidad (`<PERSONA_1>`, `<DNI_1>`, `<TELEFONO_1>`, `<DIRECCION_1>`) con la misma etiqueta en todo el documento: reconoce el apellido suelto, nombres sin tilde y DNI o teléfonos escritos con otro formato. Guarda `archivo.mapa.json`. |
 | `--desanonimizar resp.txt` | Restaura los datos reales en un texto (ej. respuesta de la IA) usando `--mapa`. |
 | `--mapa archivo.mapa.json` | Ruta al mapa de equivalencias generado por `--seudonimos`. |
+| `--sellos` | En PDF de escrituras, tapa los sellos del escribano (el OCR no lee su nombre). |
 | `--umbral 0.35` | Confianza mínima, de 0 a 1. Un valor más alto detecta menos. |
 | `--columnas a,b,c` | En CSV o Excel, analiza solo esas columnas. |
 | `--ocultar-columnas a,b` | Sustituye la columna entera sin analizarla. |
