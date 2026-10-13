@@ -2,12 +2,15 @@
 
 Uso:
     python anonimizar.py                 # procesa todo input/ y deja el resultado en output/
-    python anonimizar.py archivo.csv     # procesa solo ese archivo (resultado en output/)
+    python anonimizar.py archivo.pdf     # procesa solo ese archivo (resultado en output/)
+    python anonimizar.py --desanonimizar resp_ia.txt --mapa output/archivo.mapa.json
 
 Opciones:
     --idioma es|en
     --modo reemplazar|mascara|hash|borrar
-    --seudonimos                 mismo valor -> mismo sustituto (PERSON_1, EMAIL_ADDRESS_3...)
+    --seudonimos                 numera cada entidad (<PERSONA_1>, <DNI_1>...) igual en todo el documento y guarda .mapa.json
+    --desanonimizar archivo.txt  restaura los datos reales en un texto usando un mapa de equivalencias
+    --mapa archivo.mapa.json     archivo con el glosario de correspondencias para --desanonimizar
     --umbral 0.35                confianza mínima (0-1)
     --columnas a,b,c             (CSV/XLSX) solo analiza estas columnas
     --ocultar-columnas a,b       (CSV/XLSX) sustituye la columna entera sin analizarla
@@ -22,8 +25,10 @@ import csv
 import difflib
 import hashlib
 import io
+import json
 import re
 import sys
+import unicodedata
 
 import numpy as np
 from collections import defaultdict
@@ -34,17 +39,390 @@ import winocr
 from PIL import Image, ImageDraw, ImageFont
 from presidio_analyzer import AnalyzerEngine, BatchAnalyzerEngine, Pattern, PatternRecognizer, RecognizerResult
 from presidio_analyzer.nlp_engine import NlpEngineProvider
-from presidio_anonymizer import AnonymizerEngine
-from presidio_anonymizer.entities import OperatorConfig
 
 BASE = Path(__file__).parent
 INPUT, OUTPUT = BASE / "input", BASE / "output"
 MODELOS = {"es": "es_core_news_lg", "en": "en_core_web_lg"}
 TEXTO_PLANO = {".txt", ".md", ".json", ".log", ".xml", ".html"}
 TABLAS = {".csv", ".tsv"}
-MAX_BLOQUE = 100_000  # caracteres por bloque de texto (spaCy admite 1M como máximo)
+MAX_BLOQUE = 100_000
 FILAS_LOTE = 5_000
 
+ETIQUETAS_ES = {
+    "PERSON": "PERSONA",
+    "LOCATION": "LUGAR",
+    "DIRECCION": "DIRECCION",
+    "ORGANIZATION": "ORGANIZACION",
+    "AR_DNI": "DNI",
+    "AR_CUIT": "CUIT",
+    "EMAIL_ADDRESS": "EMAIL",
+    "PHONE_NUMBER": "TELEFONO",
+    "DATE_TIME": "FECHA",
+    "IBAN_CODE": "CBU",
+    "IP_ADDRESS": "IP",
+    "URL": "WEB",
+    "NRP": "DOCUMENTO",
+}
+
+
+# ==============================================================================
+# STOPWORDS Y REGLAS DE CALIBRACIÓN JURÍDICA
+# ==============================================================================
+
+STOPWORDS_ESTRUCTURA = {
+    "apartado", "clausula", "articulo", "inciso", "capitulo", "titulo", "seccion", "anexo",
+    "primero", "segundo", "tercero", "cuarto", "quinto", "sexto", "septimo", "octavo", "noveno", "decimo",
+    "undecimo", "duodecimo", "primera", "segunda", "tercera", "cuarta", "quinta", "sexta", "septima", "octava",
+    "novena", "decima", "pri", "ero", "priero", "ercero", "quinto", "cuarto", "segundo", "tercero",
+    "cuerda", "concuerda", "matriz", "folio", "foja", "protocolo", "testimonio", "notarial",
+    "escritura", "numero", "comparecen", "compareciente", "comparecientes", "otorgante", "otorgantes",
+    "suscribe", "suscriben", "objeto", "denominacion", "duracion", "domicilio", "sede", "capital",
+    "cuotas", "cuota", "administracion", "representacion", "fiscalizacion", "gobierno", "gerencia",
+    "gerente", "gerentes", "socio", "socios", "socia", "socias", "asamblea", "reunion", "reuniones",
+    "ejercicio", "balance", "utilidades", "reservas", "disolucion", "liquidacion", "liquidador",
+    "liquidadores", "cesion", "preferencia", "fallecimiento", "incapacidad", "herederos", "sucesion",
+    "incorporacion", "extinguido", "disuelto", "liquidado", "aprobado", "inscripto", "suscripto",
+    "integrado", "legal", "especial", "real", "constituido", "social", "quienes", "quien",
+    "cuales", "cual", "mismo", "misma", "dicho", "dicha", "presente", "siguiente", "titular",
+}
+
+STOPWORDS_TIPO_SOCIEDAD = {
+    "sociedad", "sociedades", "responsabilidad", "limitada", "anonima", "acciones",
+    "s.r.l.", "s.a.", "s.a.s.", "srl", "sa", "sas", "constitucion", "estatuto", "contrato",
+    "sociedad de responsabilidad limitada", "sociedad anonima",
+}
+
+ORGANISMOS_PUBLICOS_LEYES = {
+    "ley", "leyes", "la ley", "decreto", "resolucion", "codigo", "codigo civil", "codigo comercial",
+    "codigo civil y comercial", "inspeccion general de justicia", "igj", "registro publico de comercio",
+    "registro publico", "banco de la nacion argentina", "banco nacion", "banco", "nacion argentina",
+    "nacion argentinas", "afip", "dgi", "anses", "arca", "poder judicial", "justicia",
+    "estado nacional", "republica argentina", "boletin oficial",
+}
+
+TITULOS_PROFESIONES_ESTADO = {
+    "escribano", "escribana", "notario", "notaria", "escribano publico", "escribana publica", "publico", "publica",
+    "abogado", "abogada", "procurador", "procuradora", "contador", "contadora", "licenciado", "licenciada",
+    "ingeniero", "ingeniera", "comerciante", "empleado", "empleada", "dr", "dra", "lic", "ing",
+    "senor", "senora", "sr", "sra", "don", "dona", "presidente", "vicepresidente", "director", "directora",
+    "casado", "casada", "soltero", "soltera", "divorciado", "divorciada", "viudo", "viuda",
+    "argentino", "argentina", "argentinos", "argentinas", "argent inor", "nacido", "nacida",
+}
+
+TERMINOS_DOCUMENTOS = {
+    "documento", "documento nacional de identidad", "dni", "le", "lc", "ci", "pasaporte",
+    "identidad", "cuit", "cuil", "cdi",
+}
+
+TERMINOS_GENERICOS_OBJETO = {
+    "call center", "software", "hardware", "marketing", "turnos", "videollamadas",
+    "procesamiento", "datos", "servicios", "asesoramiento", "consultoria", "internet", "web",
+}
+
+LUGARES_GENERICOS = {
+    "ciudad", "provincia", "partido", "municipio", "republica", "pais", "nacion", "localidad",
+}
+
+RUIDO_SELLOS = {
+    "oe esc", "oe esc 10 t", "ve esc", "ve esc q08941", "t bros", "r.863", "q:s65", "aro", "ribano",
+}
+
+CONECTORES_Y_ARTICULOS = {
+    "el", "la", "los", "las", "lo", "de", "del", "y", "e", "a", "al", "en", "con", "por", "para", "ei",
+}
+
+TODAS_STOPWORDS = (
+    STOPWORDS_ESTRUCTURA | STOPWORDS_TIPO_SOCIEDAD | ORGANISMOS_PUBLICOS_LEYES |
+    TITULOS_PROFESIONES_ESTADO | TERMINOS_DOCUMENTOS | TERMINOS_GENERICOS_OBJETO |
+    LUGARES_GENERICOS | RUIDO_SELLOS | CONECTORES_Y_ARTICULOS
+)
+
+BORDES_RECORTE = CONECTORES_Y_ARTICULOS | {
+    "senor", "senora", "don", "dona", "escribano", "escribana", "publico", "publica",
+    "ante", "mi", "que", "se", "su", "sus", "como", "titular", "socio", "socia", "gerente",
+}
+
+PREFIJOS_DATOS = {
+    "DIRECCION": re.compile(
+        r"(?i)^(?:domiciliad[oa]s?\s+en|(?:(?:con|fija(?:ndo)?|se\s+fija\s+el)\s+)?domicilio\s+(?:real|legal|especial|constituido|social)?\s*en|sit[oa]s?\s+en|(?:con\s+)?sede\s+(?:social\s+)?en)\s*"
+    ),
+    "AR_DNI": re.compile(r"(?i)^(?:identidad|d\.?\s*n\.?\s*i\.?|documento\s+nacional\s+de\s+identidad)\s*(?:n[°º.]?\s*)?"),
+    "AR_CUIT": re.compile(r"(?i)^c\.?\s*u\.?\s*i\.?\s*[tl]\.?\s*(?:n[°º.]?\s*)?"),
+    "ORGANIZATION": re.compile(r'(?i)^(?:(?:se\s+)?denomina\s*|nombre\s+de\s+la\s+sociedad\s*|sociedad\s*)["\']?\s*'),
+}
+
+
+def norm(texto):
+    t = texto.strip().strip(",.;:()[]{}¿?¡!\"'/-")
+    t = re.sub(r"\s+", " ", t).lower()
+    return "".join(c for c in unicodedata.normalize("NFD", t) if unicodedata.category(c) != "Mn")
+
+
+# Tipos numéricos: se comparan solo por sus dígitos, así "29.494 786" y "29494786" son el mismo dato.
+NUMERICOS = {"AR_DNI", "AR_CUIT", "PHONE_NUMBER", "IBAN_CODE"}
+
+
+def clave(tipo, valor):
+    """Forma canónica de un valor para decidir si dos menciones son la misma entidad."""
+    if tipo in NUMERICOS:
+        digitos = re.sub(r"\D", "", valor)
+        if tipo == "AR_DNI":
+            return digitos.lstrip("0")
+        if tipo == "PHONE_NUMBER":
+            return digitos[-8:]  # ignora prefijos +54, 011, 15
+        return digitos
+    return norm(limpiar_direccion_val(valor))
+
+
+def sim(a, b):
+    return difflib.SequenceMatcher(None, norm(a), norm(b)).ratio()
+
+
+# Espacio entre palabras, tolerando la numeración de margen notarial que el OCR intercala entre ellas
+SEPARADOR_OCR = r"\s+(?:\d{1,2}\s+)?"
+
+VOCALES = {"a": "aáà", "e": "eéè", "i": "iíì", "o": "oóò", "u": "uúüù"}
+
+
+def patron_palabra(palabra):
+    """Regex de una palabra que ignora tildes (Pérez = Perez)."""
+    partes = []
+    for c in palabra:
+        base = norm(c) if c.isalpha() else ""
+        partes.append(f"[{VOCALES[base]}]" if base in VOCALES else re.escape(c))
+    return "".join(partes)
+
+
+def limpiar_direccion_val(v):
+    # Elimina saltos de línea producidos por numeración de margen notarial (ej. 'Lavalle\n27\n1290...')
+    return re.sub(r"\n\s*\d{1,2}\s*\n", " ", v)
+
+
+def es_falso_positivo(tipo, valor, texto_completo="", inicio=0, estricto=True):
+    val_limpio = valor.strip().strip(",.;:()[]{}¿?¡!\"'/-")
+    n = norm(val_limpio)
+    if not n or len(n) < 2:
+        return True
+    if n in TODAS_STOPWORDS:
+        return True
+
+    words = [norm(w) for w in val_limpio.split() if norm(w)]
+    if not words:
+        return True
+    if all(w in TODAS_STOPWORDS for w in words):
+        return True
+
+    if not any(c.isalpha() for c in val_limpio) and tipo not in {"AR_DNI", "AR_CUIT", "PHONE_NUMBER"}:
+        return True
+
+    # Comparación difusa contra vocabulario de estructura jurídica (ej. ERCERO, PRIERO)
+    if len(words) == 1 and len(n) >= 4:
+        for est in STOPWORDS_ESTRUCTURA:
+            if abs(len(n) - len(est)) <= 1 and difflib.SequenceMatcher(None, n, est).ratio() >= 0.8:
+                return True
+
+    n_sin_espacios = n.replace(" ", "")
+    if n_sin_espacios in STOPWORDS_ESTRUCTURA:
+        return True
+
+    if tipo == "PERSON":
+        tokens_orig = [w for w in val_limpio.split() if w]
+        if estricto and not any(w[0].isupper() for w in tokens_orig):
+            return True
+        if len(words) == 1:
+            if n in STOPWORDS_ESTRUCTURA or n in TITULOS_PROFESIONES_ESTADO or n in LUGARES_GENERICOS:
+                return True
+
+    elif tipo == "ORGANIZATION":
+        if len(words) == 1 and not re.search(r"\b(srl|sa|sas)\b", n):
+            return True
+        if n in STOPWORDS_TIPO_SOCIEDAD or n in ORGANISMOS_PUBLICOS_LEYES:
+            return True
+
+    elif tipo == "LOCATION":
+        if n in {"la ley", "ley", "ciudad", "provincia", "banco", "segundo", "call center", "argentina"}:
+            return True
+        if len(words) == 1 and n in LUGARES_GENERICOS:
+            return True
+
+    elif tipo == "PHONE_NUMBER":
+        digits = "".join(c for c in val_limpio if c.isdigit())
+        previo = texto_completo[max(0, inicio - 30):inicio]
+        # Formato de DNI (12.345.678) o número de foja notarial ("A 091331742")
+        if re.fullmatch(r"\d{1,2}\.\d{3}\.\d{3}", val_limpio):
+            return True
+        if 8 <= len(digits) <= 10 and re.search(r"(?:^|\s)A\s*$", previo[-6:], re.I):
+            return True
+        # Una tira de dígitos sin separadores solo es teléfono si el texto lo dice
+        if digits == val_limpio and not re.search(r"(?i)tel|cel|m[oó]vil|whats|contacto|llamar", previo):
+            return True
+
+    elif tipo == "URL":
+        if not re.search(r"https?://|www\.|\.(com|net|org|ar|io)\b", val_limpio, re.I):
+            return True
+
+    return False
+
+
+def recortar_bordes(texto, inicio, fin):
+    while inicio < fin and texto[inicio] in " \t\r\n,.;:()[]{}¿?¡!\"'/-":
+        inicio += 1
+    while fin > inicio and texto[fin - 1] in " \t\r\n,.;:()[]{}¿?¡!\"'/-":
+        fin -= 1
+
+    tokens = [(m.start() + inicio, m.end() + inicio) for m in re.finditer(r"\S+", texto[inicio:fin])]
+    while tokens and norm(texto[tokens[0][0]:tokens[0][1]]) in BORDES_RECORTE:
+        tokens.pop(0)
+    while tokens and norm(texto[tokens[-1][0]:tokens[-1][1]]) in BORDES_RECORTE:
+        tokens.pop()
+
+    if not tokens:
+        return inicio, inicio
+    nuevo_ini, nuevo_fin = tokens[0][0], tokens[-1][1]
+    while nuevo_ini < nuevo_fin and texto[nuevo_ini] in " \t\r\n,.;:()[]{}¿?¡!\"'/-":
+        nuevo_ini += 1
+    while nuevo_fin > nuevo_ini and texto[nuevo_fin - 1] in " \t\r\n,.;:()[]{}¿?¡!\"'/-":
+        nuevo_fin -= 1
+    return nuevo_ini, nuevo_fin
+
+
+def depurar_resultados(texto, resultados, estricto=True):
+    limpios = []
+    for r in resultados:
+        tipo, inicio, fin = r.entity_type, r.start, r.end
+        pref = PREFIJOS_DATOS.get(tipo)
+        if pref:
+            m = pref.match(texto[inicio:fin])
+            if m:
+                inicio += m.end()
+
+        inicio, fin = recortar_bordes(texto, inicio, fin)
+        if inicio >= fin:
+            continue
+
+        valor = texto[inicio:fin]
+        if es_falso_positivo(tipo, valor, texto, inicio, estricto=estricto):
+            continue
+
+        if tipo == "LOCATION" and re.search(r"\b\d{1,5}\b", valor):
+            tipo = "DIRECCION"
+
+        # Si una LOCATION es una calle (viene después de "domicilio en", "calle"...) y continúa con altura/piso
+        previo = norm(texto[max(0, inicio - 40):inicio])
+        if tipo == "LOCATION" and re.search(r"\b(domicili\w*|sede|sit[oa]s?|calle|avenida|av)(\W+\w+){0,3}$", previo):
+            resto = texto[fin:fin + 60]
+            m_alt = re.match(r"(?:[ \t]+|(?:[ \t]*\n(?:\s*\d{1,2}\s*\n)?[ \t]*))(\d{1,5}\b(?:[ \t]*,?[ \t]*(?:piso|p\.|pb)\s*\d+)?(?:[ \t]*,?[ \t]*(?:dto|depto|oficina|of\.)\s*[a-z0-9]+)?)", resto, re.I)
+            if m_alt:
+                fin += m_alt.end()
+                tipo = "DIRECCION"
+                valor = texto[inicio:fin]
+
+        # Si PERSON tiene solo nombres de pila y le sigue un apellido
+        if tipo == "PERSON":
+            resto = texto[fin:fin + 50]
+            m_ape = re.match(r"(?:[ \t]+|(?:[ \t]*\n(?:\s*\d{1,2}\s*\n)?[ \t]*))([A-ZÁÉÍÓÚÑ][a-záéíóúñA-ZÁÉÍÓÚÑ'’\-]{2,25}(?:\s+(?:de|del|la|los|de\s+la)\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñA-ZÁÉÍÓÚÑ'’\-]+)?)\b", resto)
+            if m_ape:
+                ape_candidato = m_ape.group(1)
+                n_ape = norm(ape_candidato)
+                if n_ape not in TODAS_STOPWORDS and not any(w in TODAS_STOPWORDS for w in n_ape.split()):
+                    fin += m_ape.end()
+                    valor = texto[inicio:fin]
+
+        limpios.append(RecognizerResult(tipo, inicio, fin, r.score))
+
+    limpios.sort(key=lambda x: (x.start, -(x.end - x.start)))
+    aceptados, pos_fin = [], -1
+    for r in limpios:
+        if r.start < pos_fin:
+            continue
+        aceptados.append(r)
+        pos_fin = r.end
+
+    return aceptados
+
+
+def sin_solapes(resultados):
+    aceptados, fin = [], -1
+    for resultado in sorted(resultados, key=lambda r: (r.start, -(r.end - r.start))):
+        inicio = max(resultado.start, fin)
+        if inicio >= resultado.end:
+            continue
+        if inicio != resultado.start:
+            resultado = RecognizerResult(resultado.entity_type, inicio, resultado.end, resultado.score)
+        aceptados.append(resultado)
+        fin = resultado.end
+    return aceptados
+
+
+# ==============================================================================
+# RECONOCEDORES ESPECÍFICOS DE ARGENTINA
+# ==============================================================================
+
+def reconocedores_argentina():
+    """DNI, CUIT/CUIL, Direcciones y Sociedades en Argentina."""
+    return [
+        PatternRecognizer(
+            supported_entity="AR_DNI",
+            supported_language="es",
+            patterns=[
+                Pattern("dni_frase", r"(?i)(?:identidad|d\.?n\.?i\.?|documento\s+nacional\s+de\s+identidad)\s*(?:n[°º.]?\s*)?(\d{1,2}[\d.\s,]{5,12}\d)", 0.95),
+            ],
+            context=["dni", "documento", "identidad"],
+        ),
+        PatternRecognizer(
+            supported_entity="AR_CUIT",
+            supported_language="es",
+            patterns=[
+                Pattern("cuit", r"\b\d{2}[-\s]?\d{8}[-\s—–]?\d\b", 0.95),
+                Pattern("cuit_frase", r"(?i)cui[tl]\s*\d{2}[\D\s]+\d{8}[\D\s]+\d", 0.95),
+            ],
+            context=["cuit", "cuil"],
+        ),
+        PatternRecognizer(
+            supported_entity="DIRECCION",
+            supported_language="es",
+            patterns=[
+                Pattern(
+                    "domicilio_con_formula",
+                    r"(?i)\b(?:domiciliad[oa]s?\s+en|(?:(?:con|fija(?:ndo)?|se\s+fija\s+el)\s+)?domicilio\s+(?:real|legal|especial|constituido|social)?\s*en|sit[oa]s?\s+en|(?:con\s+)?sede\s+(?:social\s+)?en)\s+"
+                    r"([A-ZÁÉÍÓÚÑ][a-záéíóúñA-ZÁÉÍÓÚÑ0-9\s\.\-]{2,35}?"
+                    r"(?:\n\s*\d{1,2}\s*\n\s*)?"
+                    r"\b\d{1,5}\b"
+                    r"(?:\s*(?:,\s*)?(?:piso|p\.|pb|planta\s+baja)\s*\d{1,3}\b)?"
+                    r"(?:\s*(?:,\s*)?(?:dto\.?|depto\.?|departamento|oficina|of\.)\s*[a-z0-9]{1,4}\b)?)"
+                    r"(?:\s*(?:,\s*)?(?-i:([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+de\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+)?)))?",
+                    0.95,
+                ),
+                Pattern(
+                    "calle_con_tipo",
+                    r"(?i)\b(?:av(?:enida|\.)?|calle|pje\.?|pasaje|bv(?:ld|\.)?|boulevard|ruta\s+\d+|diagonal)\s+"
+                    r"([A-ZÁÉÍÓÚÑ][a-záéíóúñA-ZÁÉÍÓÚÑ0-9\s\.\-]{2,35}?\b\d{1,5}\b"
+                    r"(?:\s*(?:,\s*)?(?:piso|p\.|pb|planta\s+baja)\s*\d{1,3}\b)?"
+                    r"(?:\s*(?:,\s*)?(?:dto\.?|depto\.?|departamento|oficina|of\.)\s*[a-z0-9]{1,4}\b)?)"
+                    r"(?:\s*(?:,\s*)?(?-i:([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+de\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+)?)))?",
+                    0.95,
+                ),
+            ],
+            context=["domicilio", "domiciliado", "domiciliada", "sede", "calle", "avenida", "direccion"],
+        ),
+        PatternRecognizer(
+            supported_entity="ORGANIZATION",
+            supported_language="es",
+            patterns=[
+                Pattern(
+                    "sociedad_nombre",
+                    r'(?i)"([A-ZÁÉÍÓÚÑ0-9\s\.\-]{3,40}?\b(?:S\.?\s?R\.?\s?[LI]\.?|S\.?\s?A\.?\s?S\.?|S\.A\.))"',
+                    0.95,
+                ),
+            ],
+            context=["sociedad", "denomina", "srl", "sa"],
+        ),
+    ]
+
+
+# ==============================================================================
+# CLASE PRINCIPAL: ANONIMIZADOR CON CORREFERENCIA
+# ==============================================================================
 
 class Anonimizador:
     def __init__(self, idioma, modo, umbral, seudonimos):
@@ -57,97 +435,277 @@ class Anonimizador:
         for reconocedor in reconocedores_argentina():
             self.analyzer.registry.add_recognizer(reconocedor)
         self.batch = BatchAnalyzerEngine(self.analyzer)
-        self.anonymizer = AnonymizerEngine()
         self.idioma, self.modo, self.umbral, self.seudonimos = idioma, modo, umbral, seudonimos
-        self.mapa = defaultdict(dict)  # tipo -> {valor original: seudónimo}
         self.conteo = defaultdict(int)
-        tipos = self.analyzer.get_supported_entities(idioma)
-        self.ops = {t: self._operador(t) for t in tipos} if seudonimos else self._operadores_modo()
+        self.nuevo_documento()
 
-    def _operadores_modo(self):
-        if self.modo == "mascara":
-            op = OperatorConfig("mask", {"masking_char": "*", "chars_to_mask": 1000, "from_end": False})
-        elif self.modo == "hash":
-            op = OperatorConfig("hash", {"hash_type": "sha256"})
-        elif self.modo == "borrar":
-            op = OperatorConfig("redact", {})
-        else:
-            return None  # por defecto Presidio reemplaza por <TIPO_ENTIDAD>
-        return {"DEFAULT": op}
+    def nuevo_documento(self):
+        """Reinicia el estado de clusters y seudónimos para un nuevo documento."""
+        self.clusters = defaultdict(list)
+        self.indices = defaultdict(int)
+        self.mapa_reemplazos = {}
+        self.equivalencias_dict = {}
+        self.patrones = []
 
-    def _operador(self, tipo):
-        return OperatorConfig("custom", {"lambda": lambda valor: self.seudonimo(tipo, valor)})
+    def registrar_cluster(self, etype, val):
+        val_clean = val.strip().strip(",.;:()[]{}¿?¡!\"'/-")
+        if etype not in NUMERICOS:
+            val_clean = re.sub(r"\s+", " ", limpiar_direccion_val(val_clean))
+        n_val = clave(etype, val_clean)
+        if not n_val:
+            return f"<{ETIQUETAS_ES.get(etype, etype)}>"
+        val_words = n_val.split()
 
-    def seudonimo(self, tipo, valor):
-        tabla = self.mapa[tipo]
-        if valor not in tabla:
-            tabla[valor] = f"{tipo}_{len(tabla) + 1}"
-        return tabla[valor]
+        best_c, best_score = None, 0.0
+        for c in self.clusters[etype]:
+            if n_val in c["norm_variants"]:
+                best_c, best_score = c, 1.0
+                break
+            c_norm = clave(etype, c["canonical"])
+            if etype == "PERSON":
+                c_words = c_norm.split()
+                if len(val_words) >= 2 and len(c_words) >= len(val_words) and val_words == c_words[:len(val_words)]:
+                    score = 0.95
+                elif len(c_words) >= 2 and len(val_words) >= len(c_words) and c_words == val_words[:len(c_words)]:
+                    score = 0.95
+                elif len(val_words) == 1 and any(sim(val_words[0], s) >= 0.80 for s in c["surnames"]):
+                    score = 0.92
+                elif len(val_words) >= 2 and len(c_words) >= 2:
+                    fn_sim = sim(" ".join(val_words[:-1]), " ".join(c_words[:-1]))
+                    if fn_sim >= 0.85:
+                        sur_sim = max((sim(val_words[-1], s) for s in c["surnames"]), default=0.0)
+                        score = 0.92 if sur_sim >= 0.65 else 0.0
+                    else:
+                        score = sim(n_val, c_norm)
+                else:
+                    score = sim(n_val, c_norm)
 
-    def ocultar(self, tipo, valor):
-        """Sustituye un valor completo sin analizarlo (columnas marcadas como sensibles)."""
-        if not valor or not valor.strip():
-            return valor
-        self.conteo[tipo] += 1
-        if self.seudonimos:
-            return self.seudonimo(tipo, valor)
-        if self.modo == "mascara":
-            return "*" * len(valor)
-        if self.modo == "borrar":
-            return ""
-        if self.modo == "hash":
-            return hashlib.sha256(valor.encode()).hexdigest()
-        return f"<{tipo}>"
+            elif etype == "DIRECCION":
+                # Misma calle y misma altura, aunque una mención agregue piso/oficina o localidad
+                m_a = re.search(r"\b\d+\b", n_val)
+                m_b = re.search(r"\b\d+\b", c_norm)
+                if m_a and m_b and m_a.group() == m_b.group():
+                    score = max(sim(n_val[:m_a.start()], c_norm[:m_b.start()]), 0.0)
+                else:
+                    score = 0.0
+
+            elif etype in {"ORGANIZATION", "LOCATION"}:
+                score = sim(n_val, c_norm)
+            else:
+                score = 0.0  # numéricos y demás: solo coincidencia exacta de la clave
+
+            if score > best_score:
+                best_score = score
+                best_c = c
+
+        threshold = 0.70 if etype in {"PERSON", "DIRECCION", "ORGANIZATION"} else 0.85
+        if best_c and best_score >= threshold:
+            best_c["variants"].add(val_clean)
+            best_c["norm_variants"].add(n_val)
+            best_c["frecuencia"][val_clean] += 1
+            if etype == "PERSON" and val_words:
+                best_c["surnames"].add(val_words[-1])
+            # Canónico: la forma más completa y, entre iguales, la más repetida (las lecturas
+            # erróneas del OCR suelen aparecer una sola vez)
+            best_c["canonical"] = max(best_c["frecuencia"], key=lambda v: (len(v.split()), best_c["frecuencia"][v], -sum(not (ch.isalnum() or ch.isspace()) for ch in v), len(v)))
+            self.mapa_reemplazos[(etype, n_val)] = best_c["tag"]
+            self.equivalencias_dict[best_c["tag"]] = best_c["canonical"]
+            return best_c["tag"]
+
+        self.indices[etype] += 1
+        tag = f"<{ETIQUETAS_ES.get(etype, etype)}_{self.indices[etype]}>"
+        new_c = {
+            "tag": tag,
+            "canonical": val_clean,
+            "variants": {val_clean},
+            "frecuencia": defaultdict(int, {val_clean: 1}),
+            "norm_variants": {n_val},
+            "surnames": {val_words[-1]} if (etype == "PERSON" and val_words) else set(),
+        }
+        self.clusters[etype].append(new_c)
+        self.mapa_reemplazos[(etype, n_val)] = tag
+        self.equivalencias_dict[tag] = val_clean
+        return tag
+
+    def preparar_documento(self, lista_detecciones):
+        """Agrupa las entidades del documento completo (primero las menciones más largas)
+        y arma los patrones para encontrar las demás apariciones de cada una."""
+        primera = {}
+        for i, (etype, val) in sorted(enumerate(lista_detecciones), key=lambda x: -len(x[1][1])):
+            tag = self.registrar_cluster(etype, val)
+            primera[tag] = min(primera.get(tag, i), i)
+        self._renumerar(primera)
+        self.patrones = self._patrones_propagacion()
+
+    def _renumerar(self, primera):
+        """Numera las entidades de cada tipo según su primera aparición en el documento."""
+        nuevo = {}
+        for etype, clist in self.clusters.items():
+            clist.sort(key=lambda c: primera.get(c["tag"], float("inf")))
+            for n, c in enumerate(clist, start=1):
+                nuevo[c["tag"]] = f"<{ETIQUETAS_ES.get(etype, etype)}_{n}>"
+                c["tag"] = nuevo[c["tag"]]
+        self.mapa_reemplazos = {k: nuevo.get(t, t) for k, t in self.mapa_reemplazos.items()}
+        self.equivalencias_dict = {c["tag"]: c["canonical"] for clist in self.clusters.values() for c in clist}
+
+    def _patrones_propagacion(self):
+        """Regex de cada entidad conocida, para marcarla también donde el modelo no la detectó."""
+        apellidos = defaultdict(set)
+        for c in self.clusters.get("PERSON", []):
+            for s in c["surnames"]:
+                apellidos[s].add(c["tag"])
+
+        patrones = []
+        for etype, clist in self.clusters.items():
+            for c in clist:
+                formas = set()
+                if etype in NUMERICOS:
+                    for v in c["variants"]:
+                        digitos = re.sub(r"\D", "", v)
+                        if len(digitos) >= 7:
+                            formas.add(r"(?<!\d)" + r"[\s.\-—–]?".join(digitos) + r"(?!\d)")
+                else:
+                    for v in c["variants"]:
+                        palabras = v.split()
+                        if len(palabras) >= 2 or (len(v) >= 4 and etype != "LOCATION"):
+                            formas.add(r"\b" + SEPARADOR_OCR.join(patron_palabra(p) for p in palabras) + r"\b")
+                    if etype == "PERSON":
+                        # Apellido suelto, solo si no lo comparte con otra persona
+                        for s in c["surnames"]:
+                            if len(s) >= 4 and s not in TODAS_STOPWORDS and apellidos[s] == {c["tag"]}:
+                                formas.add(r"\b" + patron_palabra(s) + r"\b")
+                for f in formas:
+                    patrones.append((etype, re.compile(f, re.IGNORECASE)))
+        return patrones
+
+    def completar(self, texto, resultados):
+        """Agrega las apariciones de entidades ya conocidas que el modelo no detectó en este texto."""
+        if not getattr(self, "patrones", None):
+            return resultados
+        candidatos = []
+        for etype, patron in self.patrones:
+            for m in patron.finditer(texto):
+                if etype == "PERSON" and not texto[m.start()].isupper():
+                    continue
+                candidatos.append(RecognizerResult(etype, m.start(), m.end(), 1.0))
+
+        # Una aparición conocida más larga reemplaza a detecciones parciales que contiene
+        # (ej. el modelo vio solo "Gomez" en "María Laura Gomez")
+        actuales = list(resultados)
+        for c in sorted(candidatos, key=lambda r: -(r.end - r.start)):
+            solapes = [r for r in actuales if c.start < r.end and c.end > r.start]
+            if any(r.start < c.start or r.end > c.end or (r.end - r.start) >= (c.end - c.start) for r in solapes):
+                continue
+            actuales = [r for r in actuales if r not in solapes] + [c]
+        return sorted(actuales, key=lambda r: r.start)
 
     def etiqueta(self, tipo, valor):
-        """Texto que reemplaza un dato, sin contarlo (el conteo lo hace _aplicar)."""
-        if self.seudonimos:
-            return self.seudonimo(tipo, valor)
-        if self.modo == "mascara":
-            return "*" * len(valor)
-        if self.modo == "borrar":
-            return ""
-        if self.modo == "hash":
-            return hashlib.sha256(valor.encode()).hexdigest()[:16]
-        return f"<{tipo}>"
+        tipo_es = ETIQUETAS_ES.get(tipo, tipo)
+        if not self.seudonimos:
+            if self.modo == "mascara":
+                return "*" * len(valor)
+            if self.modo == "borrar":
+                return ""
+            if self.modo == "hash":
+                return hashlib.sha256(valor.encode()).hexdigest()[:16]
+            return f"<{tipo_es}>"
+
+        val_clean = valor.strip().strip(",.;:()[]{}¿?¡!\"'/-")
+        n_val = clave(tipo, val_clean)
+        if (tipo, n_val) in self.mapa_reemplazos:
+            return self.mapa_reemplazos[(tipo, n_val)]
+        return self.registrar_cluster(tipo, valor)
+
+    def ocultar(self, tipo, valor):
+        if not valor or not valor.strip():
+            return valor
+        tipo_es = ETIQUETAS_ES.get(tipo, tipo)
+        self.conteo[tipo_es] += 1
+        return self.etiqueta(tipo, valor)
+
+    def equivalencias(self):
+        def orden(etiqueta):
+            tipo, _, n = etiqueta.strip("<>").rpartition("_")
+            return tipo, int(n) if n.isdigit() else 0
+        return {e: self.equivalencias_dict[e] for e in sorted(self.equivalencias_dict, key=orden)}
+
+    def guardar_mapa(self, ruta_mapa, nombre_archivo=""):
+        equiv = self.equivalencias()
+        if not equiv:
+            return
+        datos = {
+            "archivo": nombre_archivo,
+            "total_entidades": len(equiv),
+            "equivalencias": equiv,
+        }
+        with open(ruta_mapa, "w", encoding="utf-8") as f:
+            json.dump(datos, f, ensure_ascii=False, indent=2)
+        print(f"  mapa -> {ruta_mapa}")
+
+    def analizar_texto(self, texto):
+        raw = self.analyzer.analyze(text=texto, language=self.idioma, score_threshold=self.umbral)
+        return depurar_resultados(texto, raw, estricto=True)
 
     def _aplicar(self, texto, resultados):
         for r in resultados:
-            self.conteo[r.entity_type] += 1
-        return self.anonymizer.anonymize(text=texto, analyzer_results=resultados, operators=self.ops).text
+            tipo_es = ETIQUETAS_ES.get(r.entity_type, r.entity_type)
+            self.conteo[tipo_es] += 1
+
+        # Reemplazar de atrás hacia adelante para mantener los offsets exactos
+        texto_anon = texto
+        for r in sorted(resultados, key=lambda x: -x.start):
+            val = texto[r.start:r.end]
+            tag = self.etiqueta(r.entity_type, val)
+            texto_anon = texto_anon[:r.start] + tag + texto_anon[r.end:]
+        return texto_anon
+
+    def analizar_documento(self, bloques):
+        """Pase 1 sobre todos los bloques de un documento: detecta, agrupa entidades
+        y completa las apariciones que el modelo no vio. Devuelve los resultados por bloque."""
+        resultados = [self.analizar_texto(b) if b and b.strip() else [] for b in bloques]
+        self.preparar_documento([(r.entity_type, b[r.start:r.end])
+                                 for b, res in zip(bloques, resultados) for r in res])
+        return [self.completar(b, res) if b else res for b, res in zip(bloques, resultados)]
+
+    def documento(self, bloques):
+        """Anonimiza una lista de textos que forman un mismo documento, con etiquetas homogéneas."""
+        resultados = self.analizar_documento(bloques)
+        return [self._aplicar(b, res) if res else b for b, res in zip(bloques, resultados)]
 
     def texto(self, texto):
-        """Anonimiza un texto de cualquier longitud, dividiéndolo en bloques por líneas."""
         if not texto or not texto.strip():
             return texto
-        bloques, actual = [], ""
-        for linea in texto.splitlines(keepends=True):
-            if actual and len(actual) + len(linea) > MAX_BLOQUE:
-                bloques.append(actual)
-                actual = ""
-            actual += linea
-        bloques.append(actual)
-        return "".join(self._aplicar(b, self.analyzer.analyze(text=b, language=self.idioma,
-                                                               score_threshold=self.umbral))
-                       for b in bloques)
+        return self.documento([texto])[0]
 
     def valores(self, valores, contexto, cache):
-        """Anonimiza en lote los valores de una columna; usa la cabecera como contexto."""
         pendientes = [v for v in dict.fromkeys(valores) if v not in cache and v and v.strip()]
         if pendientes:
             analisis = self.batch.analyze_iterator(pendientes, language=self.idioma, batch_size=256,
                                                    score_threshold=self.umbral, context=[contexto])
             for v, res in zip(pendientes, analisis):
-                cache[v] = self._aplicar(v, res)
+                dep = depurar_resultados(v, res, estricto=False)
+                cache[v] = self._aplicar(v, dep)
         return [cache.get(v, v) for v in valores]
 
+
+# ==============================================================================
+# PROCESAMIENTO DE FORMATOS Y PDF
+# ==============================================================================
 
 def lista(texto):
     return {c.strip().lower() for c in texto.split(",") if c.strip()} if texto else set()
 
 
+def leer_texto(ruta):
+    for cod in ("utf-8-sig", "cp1252", "latin-1"):
+        try:
+            return ruta.read_text(encoding=cod)
+        except UnicodeDecodeError:
+            continue
+    return None
+
+
 def anonimizar_filas(filas, cabecera, anon, columnas, ocultas, caches):
-    """Procesa un lote de filas columna a columna."""
     for i, nombre in enumerate(cabecera):
         clave = nombre.strip().lower()
         col = [f[i] if i < len(f) else "" for f in filas]
@@ -162,14 +720,6 @@ def anonimizar_filas(filas, cabecera, anon, columnas, ocultas, caches):
                 f[i] = v
 
 
-def leer_texto(ruta):
-    for cod in ("utf-8-sig", "cp1252", "latin-1"):
-        try:
-            return ruta.read_text(encoding=cod)
-        except UnicodeDecodeError:
-            continue
-
-
 def procesar_csv(entrada, salida, anon, columnas, ocultas):
     contenido = leer_texto(entrada)
     try:
@@ -178,11 +728,7 @@ def procesar_csv(entrada, salida, anon, columnas, ocultas):
         dialecto = csv.excel_tab if entrada.suffix.lower() == ".tsv" else csv.excel
     lector = csv.reader(contenido.splitlines(), dialecto)
     cabecera = next(lector)
-    faltan = (columnas | ocultas) - {c.strip().lower() for c in cabecera}
-    if faltan:
-        print(f"  Aviso: columnas no encontradas: {', '.join(sorted(faltan))}")
     caches = defaultdict(dict)
-    total = 0
     with open(salida, "w", encoding="utf-8-sig", newline="") as f:
         escritor = csv.writer(f, delimiter=dialecto.delimiter, quotechar=dialecto.quotechar or '"')
         escritor.writerow(cabecera)
@@ -192,14 +738,10 @@ def procesar_csv(entrada, salida, anon, columnas, ocultas):
             if len(lote) >= FILAS_LOTE:
                 anonimizar_filas(lote, cabecera, anon, columnas, ocultas, caches)
                 escritor.writerows(lote)
-                total += len(lote)
-                print(f"  {total} filas...", flush=True)
                 lote = []
         if lote:
             anonimizar_filas(lote, cabecera, anon, columnas, ocultas, caches)
             escritor.writerows(lote)
-            total += len(lote)
-    print(f"  {total} filas procesadas")
 
 
 def procesar_xlsx(entrada, salida, anon, columnas, ocultas):
@@ -223,15 +765,6 @@ def procesar_xlsx(entrada, salida, anon, columnas, ocultas):
     wb.save(salida)
 
 
-def parrafo_docx(p, anon):
-    original = p.text
-    nuevo = anon.texto(original)
-    if nuevo != original and p.runs:
-        p.runs[0].text = nuevo
-        for run in p.runs[1:]:
-            run.text = ""
-
-
 def procesar_docx(entrada, salida, anon):
     from docx import Document
     doc = Document(entrada)
@@ -243,140 +776,22 @@ def procesar_docx(entrada, salida, anon):
                 for celda in fila.cells:
                     yield from bloques(celda)
 
-    for p in bloques(doc):
-        parrafo_docx(p, anon)
+    parrafos = list(bloques(doc))
     for seccion in doc.sections:
         for parte in (seccion.header, seccion.footer):
-            for p in bloques(parte):
-                parrafo_docx(p, anon)
+            parrafos.extend(bloques(parte))
+
+    # Todo el documento a la vez, para que la misma persona tenga la misma etiqueta en cualquier párrafo
+    originales = [p.text for p in parrafos]
+    for p, original, nuevo in zip(parrafos, originales, anon.documento(originales)):
+        if nuevo != original and p.runs:
+            p.runs[0].text = nuevo
+            for run in p.runs[1:]:
+                run.text = ""
     doc.save(salida)
 
 
-def reconocedores_argentina():
-    """DNI y CUIT/CUIL, que Presidio no trae para Argentina."""
-    return [
-        PatternRecognizer(
-            supported_entity="AR_DNI",
-            supported_language="es",
-            patterns=[
-                Pattern("dni_puntos", r"\b\d{1,2}\.\d{3}\.\d{3}\b", 0.2),
-                Pattern("dni_frase", r"(?i)identidad\s+\d[\d.\s,]{5,18}\d", 0.8),
-            ],
-            context=["dni", "documento", "identidad"],
-        ),
-        PatternRecognizer(
-            supported_entity="AR_CUIT",
-            supported_language="es",
-            patterns=[
-                Pattern("cuit", r"\b\d{2}-\d{8}-\d\b", 0.9),
-                Pattern("cuit_frase", r"(?i)cui[tl]\s*\d{2}\D+\d{8}\D+\d", 0.85),
-            ],
-            context=["cuit", "cuil"],
-        ),
-    ]
-
-
-def letras(token):
-    return "".join(c for c in token if c.isalpha()).upper()
-
-
-PALABRAS_COMUNES = {
-    "escritura", "sociedad", "limitada", "gerente", "gerentes", "cuotas", "capital",
-    "articulo", "contrato", "escribano", "inscripcion", "registro", "comercio",
-    "responsabilidad", "constitucion", "trescientos", "administracion", "suscribe",
-    "comparecen", "domiciliado", "domiciliada", "argentino", "argentina", "soltera",
-    "casado", "abogado", "procuradora", "publico", "notarial", "primero", "segundo",
-    "tercero", "cuarto", "quinto", "sexto", "septimo", "octavo", "noveno", "decimo",
-}
-
-
-def en_mayusculas(token):
-    letras_orig = [c for c in token if c.isalpha()]
-    return bool(letras_orig) and sum(c.isupper() for c in letras_orig) >= len(letras_orig) * 0.8
-
-
-def sufijo_comun(a, b):
-    n = 0
-    for x, y in zip(reversed(a), reversed(b)):
-        if x != y:
-            break
-        n += 1
-    return n
-
-
-def parecido(palabra, semillas):
-    """Apellido en mayúsculas deformado por el OCR respecto de uno ya visto."""
-    limpia = letras(palabra)
-    if len(limpia) < 7 or limpia.lower() in PALABRAS_COMUNES or not en_mayusculas(palabra):
-        return False
-    return any(
-        difflib.SequenceMatcher(None, limpia, semilla).ratio() >= 0.64 and sufijo_comun(limpia, semilla) >= 3
-        for semilla in semillas
-    )
-
-
-def ampliar_con_parecidos(texto, palabras, resultados, semillas):
-    cubierto = [False] * len(palabras)
-    for resultado in resultados:
-        if resultado.entity_type != "PERSON":
-            continue
-        for token in texto[resultado.start:resultado.end].split():
-            limpia = letras(token)
-            if len(limpia) >= 7 and en_mayusculas(token) and limpia.lower() not in PALABRAS_COMUNES:
-                semillas.append(limpia)
-        for i, palabra in enumerate(palabras):
-            if palabra["end"] > resultado.start and palabra["start"] < resultado.end:
-                cubierto[i] = True
-    extra = []
-    for resultado in resultados:
-        if resultado.entity_type != "PERSON":
-            continue
-        siguientes = [i for i, palabra in enumerate(palabras) if palabra["start"] >= resultado.end]
-        if not siguientes or cubierto[siguientes[0]]:
-            continue
-        palabra = palabras[siguientes[0]]
-        limpia = letras(palabra["text"])
-        if (
-            len(limpia) < 7
-            or palabra["text"].endswith(":")
-            or not en_mayusculas(palabra["text"])
-            or limpia.lower() in PALABRAS_COMUNES
-        ):
-            continue
-        extra.append(RecognizerResult("PERSON", palabra["start"], palabra["end"], 0.9))
-        semillas.append(limpia)
-        cubierto[siguientes[0]] = True
-        print(f"    apellido junto al nombre: {palabra['text']}", flush=True)
-    cambio = True
-    while cambio and semillas:
-        cambio = False
-        for i, palabra in enumerate(palabras):
-            if cubierto[i] or not parecido(palabra["text"], semillas):
-                continue
-            extra.append(RecognizerResult("PERSON", palabra["start"], palabra["end"], 0.9))
-            semillas.append(letras(palabra["text"]))
-            cubierto[i] = True
-            cambio = True
-            print(f"    apellido parecido: {palabra['text']}", flush=True)
-    return extra
-
-
-def sin_solapes(resultados):
-    """Si dos detecciones se pisan, conserva el tramo que sigue después de la primera."""
-    aceptados, fin = [], -1
-    for resultado in sorted(resultados, key=lambda r: (r.start, -(r.end - r.start))):
-        inicio = max(resultado.start, fin)
-        if inicio >= resultado.end:
-            continue
-        if inicio != resultado.start:
-            resultado = RecognizerResult(resultado.entity_type, inicio, resultado.end, resultado.score)
-        aceptados.append(resultado)
-        fin = resultado.end
-    return aceptados
-
-
 def quitar_subrayado(imagen):
-    """Saca líneas horizontales largas para que el OCR lea la palabra subrayada."""
     arreglo = np.array(imagen)
     oscuro = np.array(imagen.convert("L")) < 90
     for y in range(oscuro.shape[0]):
@@ -451,7 +866,6 @@ def palabras_nativas(pagina, escala):
 
 
 def contenido_pagina(pagina):
-    """Imagen de la página, texto y cajas de cada palabra. El tercer valor indica si hubo OCR."""
     pix = pagina.get_pixmap(dpi=200)
     imagen = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
     if len((pagina.get_text("text") or "").strip()) >= 40 and pagina.get_text("words"):
@@ -521,17 +935,7 @@ def tapar(dibujo, palabras, resultado, etiqueta, papel, cache):
         dibujo.text((x0 + 2, y0 + max(0, (y1 - y0 - alto) / 2) - caja[1]), etiqueta, fill="black", font=letra)
 
 
-def analizar_pagina(texto, palabras, anon, semillas):
-    if not texto.strip():
-        return [], ""
-    resultados = anon.analyzer.analyze(text=texto, language=anon.idioma, score_threshold=anon.umbral)
-    resultados.extend(ampliar_con_parecidos(texto, palabras, resultados, semillas))
-    resultados = sin_solapes(resultados)
-    return resultados, anon._aplicar(texto, resultados)
-
-
 def es_ruido(linea):
-    """Margen, sello y numeración de la foja notarial, que no son parte del contrato."""
     if re.fullmatch(r"A\s+<PHONE_NUMBER>", linea):
         return True
     if re.search(r"tBR|BROS del|R\.?\s*863|Q:s65|^OE\b|^Esce|^DE Es", linea):
@@ -544,13 +948,13 @@ def es_ruido(linea):
         return True
     if "<" in linea:
         return False
-    letras = sum(c.isalpha() for c in linea)
-    if letras == 0:
+    letras_cant = sum(c.isalpha() for c in linea)
+    if letras_cant == 0:
         return True
-    if letras < 4 and not re.fullmatch(r"[a-záéíóúñ]{1,3}", linea, re.I):
+    if letras_cant < 4 and not re.fullmatch(r"[a-záéíóúñ]{1,3}", linea, re.I):
         return True
     compacto = re.sub(r"\s", "", linea)
-    if compacto and letras * 2 < len(compacto) and len(linea) < 24:
+    if compacto and letras_cant * 2 < len(compacto) and len(linea) < 24:
         return True
     return False
 
@@ -609,7 +1013,6 @@ def secciones(texto):
 
 
 def paginas_a_markdown(paginas, nombre):
-    """Arma un Markdown continuo, con las cláusulas en el orden de la escritura."""
     bloques = secciones(texto_continuo(paginas))
     partes = [
         "---",
@@ -617,12 +1020,12 @@ def paginas_a_markdown(paginas, nombre):
         "uso: lectura del texto anonimizado",
         "anonimizado: true",
         "origen: OCR de un PDF escaneado",
-        "etiquetas: <PERSON> persona; <LOCATION> lugar; <ORGANIZATION> organización; <AR_DNI> documento; <AR_CUIT> CUIT o CUIL; <PHONE_NUMBER> teléfono; <URL> web",
+        "etiquetas: <PERSONA_1>, <PERSONA_2> personas diferenciadas; <DIRECCION_1> domicilios; <LUGAR_1> ciudades/países; <DNI_1> documentos; <CUIT_1> CUIT o CUIL; <TELEFONO_1> teléfonos; <ORGANIZACION_1> organizaciones",
         "---",
         "",
         f"# {nombre}",
         "",
-        "Texto anonimizado, en el orden de la escritura. Las etiquetas sustituyen datos personales. El escaneo dejó errores de lectura; no hay que reconstruir lo tapado.",
+        "Texto anonimizado, en el orden de la escritura. Las etiquetas numeradas identifican de forma consistente a la misma entidad a lo largo de todo el documento para su procesamiento por IA. El escaneo dejó errores de lectura; no hay que reconstruir lo tapado.",
         "",
     ]
     for titulo, cuerpo in bloques:
@@ -636,28 +1039,48 @@ def paginas_a_markdown(paginas, nombre):
 def procesar_pdf(entrada, salida, anon):
     origen = pymupdf.open(entrada)
     destino = pymupdf.open()
-    textos = []
-    apellidos = []
+    paginas_info = []
+
+    # Pase 1: lectura de todas las páginas
     for n, pagina in enumerate(origen, start=1):
         imagen, crudo, palabras, uso_ocr = contenido_pagina(pagina)
         if uso_ocr:
             print(f"  página {n}: OCR ({len(crudo)} caracteres)", flush=True)
-        resultados, anonimizado = analizar_pagina(crudo, palabras, anon, apellidos)
+        paginas_info.append({"num": n, "imagen": imagen, "crudo": crudo, "palabras": palabras})
+
+    # Análisis conjunto: misma entidad, misma etiqueta en todas las páginas
+    for info, resultados in zip(paginas_info, anon.analizar_documento([i["crudo"] for i in paginas_info])):
+        info["resultados"] = resultados
+
+    # Pase 2: Aplicación y redacción sobre las páginas
+    textos = []
+    for info in paginas_info:
+        crudo = info["crudo"]
+        imagen = info["imagen"]
+        palabras = info["palabras"]
+        resultados = info["resultados"]
+
+        anonimizado = anon._aplicar(crudo, resultados)
         textos.append(anonimizado)
+
         dibujo = ImageDraw.Draw(imagen)
         papel = color_papel(imagen)
         cache = {}
-        for resultado in resultados:
-            valor = crudo[resultado.start:resultado.end]
-            tapar(dibujo, palabras, resultado, anon.etiqueta(resultado.entity_type, valor), papel, cache)
+        for r in resultados:
+            valor = crudo[r.start:r.end]
+            tapar(dibujo, palabras, r, anon.etiqueta(r.entity_type, valor), papel, cache)
+
         buffer = io.BytesIO()
         imagen.save(buffer, format="JPEG", quality=80)
-        nueva = destino.new_page(width=pagina.rect.width, height=pagina.rect.height)
+        pagina_orig = origen[info["num"] - 1]
+        nueva = destino.new_page(width=pagina_orig.rect.width, height=pagina_orig.rect.height)
         nueva.insert_image(nueva.rect, stream=buffer.getvalue())
+
     salida_pdf = salida.with_suffix(".pdf")
     destino.save(salida_pdf)
     destino.close()
     origen.close()
+
     salida.write_text("\n\n--- página ---\n\n".join(textos), encoding="utf-8")
     salida_md = salida.with_suffix(".md")
     salida_md.write_text(paginas_a_markdown(textos, "Escritura de constitución"), encoding="utf-8")
@@ -665,7 +1088,45 @@ def procesar_pdf(entrada, salida, anon):
     print(f"  -> {salida_md}")
 
 
+# ==============================================================================
+# DESANONIMIZACIÓN Y MAIN
+# ==============================================================================
+
+def desanonimizar(archivo_entrada, archivo_mapa, archivo_salida=None):
+    if not archivo_entrada.exists():
+        sys.exit(f"No existe el archivo de texto: {archivo_entrada}")
+    if not archivo_mapa.exists():
+        sys.exit(f"No existe el archivo mapa: {archivo_mapa}")
+
+    with open(archivo_mapa, "r", encoding="utf-8") as f:
+        mapa_datos = json.load(f)
+
+    equivalencias = mapa_datos.get("equivalencias", {})
+    if not equivalencias:
+        sys.exit(f"El archivo {archivo_mapa} no contiene equivalencias.")
+
+    texto = leer_texto(archivo_entrada)
+    if texto is None:
+        sys.exit(f"No se pudo leer el contenido de {archivo_entrada}")
+
+    reemplazos = 0
+    for etiqueta, valor_real in sorted(equivalencias.items(), key=lambda x: -len(x[0])):
+        if etiqueta in texto:
+            cant = texto.count(etiqueta)
+            texto = texto.replace(etiqueta, valor_real)
+            reemplazos += cant
+            print(f"  {etiqueta} -> {valor_real} ({cant} veces)")
+
+    if archivo_salida is None:
+        archivo_salida = archivo_entrada.parent / f"{archivo_entrada.stem}.restaurado{archivo_entrada.suffix}"
+
+    archivo_salida.write_text(texto, encoding="utf-8")
+    print(f"\nTexto restaurado guardado en: {archivo_salida}")
+    print(f"Total de reemplazos: {reemplazos}")
+
+
 def procesar(entrada, salida, anon, args):
+    anon.nuevo_documento()
     ext = entrada.suffix.lower()
     if ext == ".pdf":
         salida = salida.with_suffix(".txt")
@@ -684,6 +1145,9 @@ def procesar(entrada, salida, anon, args):
         print(f"  Formato no soportado, se omite: {entrada.name}")
         return
     print(f"  -> {salida}")
+    if anon.seudonimos:
+        ruta_mapa = salida.parent / f"{entrada.stem}.mapa.json"
+        anon.guardar_mapa(ruta_mapa, entrada.name)
 
 
 def main():
@@ -691,11 +1155,19 @@ def main():
     ap.add_argument("archivo", type=Path, nargs="?", help="si se omite, procesa todo input/")
     ap.add_argument("--idioma", choices=list(MODELOS), default="es")
     ap.add_argument("--modo", choices=["reemplazar", "mascara", "hash", "borrar"], default="reemplazar")
-    ap.add_argument("--seudonimos", action="store_true")
+    ap.add_argument("--seudonimos", action="store_true", help="diferencia entidades individualmente (<PERSONA_1>, <DIRECCION_1>...) y guarda .mapa.json")
+    ap.add_argument("--desanonimizar", type=Path, help="archivo de texto (ej. respuesta de la IA) a restaurar con datos reales")
+    ap.add_argument("--mapa", type=Path, help="archivo .mapa.json con equivalencias para desanonimizar")
     ap.add_argument("--umbral", type=float, default=0.35)
     ap.add_argument("--columnas", type=lista, default=set())
     ap.add_argument("--ocultar-columnas", type=lista, default=set())
     args = ap.parse_args()
+
+    if args.desanonimizar:
+        if not args.mapa:
+            sys.exit("Para desanonimizar debes indicar el mapa de equivalencias con --mapa ruta.mapa.json")
+        desanonimizar(args.desanonimizar, args.mapa)
+        return
 
     if args.archivo:
         if not args.archivo.exists():
@@ -703,7 +1175,7 @@ def main():
         trabajos = [(args.archivo, OUTPUT / args.archivo.name)]
     else:
         INPUT.mkdir(exist_ok=True)
-        trabajos = [(p, OUTPUT / p.relative_to(INPUT)) for p in sorted(INPUT.rglob("*")) if p.is_file()]
+        trabajos = [(p, OUTPUT / p.relative_to(INPUT)) for p in sorted(INPUT.rglob("*")) if p.is_file() and p.name != ".gitkeep"]
         if not trabajos:
             sys.exit(f"No hay archivos en {INPUT}")
 
