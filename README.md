@@ -59,21 +59,23 @@ La primera ejecución carga los modelos y puede tardar. Al terminar muestra cuá
 | `--columnas a,b,c` | En CSV o Excel, analiza solo esas columnas. |
 | `--ocultar-columnas a,b` | Sustituye la columna entera sin analizarla. |
 
-### Flujo con Inteligencia Artificial (LLM)
+### Usar el documento en un chat de IA sin exponer los datos
 
-1. **Anonimizar el documento diferenciando personas y domicilios:**
+El programa no se conecta a ninguna IA: todo corre en tu computadora. Este es el uso previsto para consultar un chat (ChatGPT, Claude, Gemini u otro) sin pasarle datos personales:
+
+1. **Anonimizá el documento con etiquetas numeradas:**
    ```powershell
    python anonimizar.py input\contrato.docx --seudonimos
    ```
-   Genera `output\contrato.docx` (con `<PERSONA_1>`, `<PERSONA_2>`, `<DIRECCION_1>`) y `output\contrato.mapa.json`.
+   Genera `output\contrato.docx` (con `<PERSONA_1>`, `<DNI_1>`, `<DIRECCION_1>`...) y `output\contrato.mapa.json`, que guarda a qué dato real corresponde cada etiqueta. El mapa no se comparte.
 
-2. **Enviar el texto anonimizado a la IA** para su análisis o redacción.
+2. **Copiá el texto anonimizado al chat** y pedí lo que necesites (revisión, resumen, redacción). La IA solo ve las etiquetas.
 
-3. **Restaurar los datos reales en la respuesta de la IA:**
+3. **Guardá la respuesta en un `.txt` y restaurá los datos reales:**
    ```powershell
-   python anonimizar.py --desanonimizar respuesta_ia.txt --mapa output\contrato.mapa.json
+   python anonimizar.py --desanonimizar respuesta.txt --mapa output\contrato.mapa.json
    ```
-   Crea `respuesta_ia.restaurado.txt` con los nombres y domicilios reales restituidos.
+   Crea `respuesta.restaurado.txt` con los nombres, documentos y domicilios reales.
 
 Ejemplo para un CSV con documento y CUIL en columnas propias:
 
