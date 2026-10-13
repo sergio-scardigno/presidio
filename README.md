@@ -68,6 +68,6 @@ python anonimizar.py input\padron.csv --seudonimos --ocultar-columnas nro_docume
 |---|---|
 | `.txt` | Texto anonimizado, página por página. |
 | `.pdf` | El escaneo original, con los datos tapados. |
-| `.md` | El mismo texto ordenado en cláusulas, para pasárselo a una IA. |
+| `.md` | El mismo texto, ordenado en cláusulas. |
 
 Si la página ya tiene texto, se usa ese texto. Si es un escaneo, se lee con el OCR en español de Windows. Hace falta el paquete de idioma es-MX.

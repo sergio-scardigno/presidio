@@ -14,7 +14,7 @@ Opciones:
 
 Formatos: .txt .md .csv .tsv .json .log .docx .xlsx .pdf
 El PDF se exporta como .txt, .pdf y .md. En el PDF se conserva la página original
-y se tapan los datos detectados. El .md ordena el texto para leerlo con una IA.
+y se tapan los datos detectados. El .md ordena el texto en cláusulas.
 Si la página no tiene texto (escaneo), se lee con el OCR en español de Windows.
 """
 import argparse
@@ -590,13 +590,13 @@ def secciones(texto):
         ("SEGUNDO:", "Suscripción, domicilio y gerencia"),
         ("escritura matriz", "Certificación de la copia"),
     )
-    encontrados, cursor = [], 0
+    encontrados, desde = [], 0
     for clave, titulo in marcas:
-        idx = texto.lower().find(clave.lower(), cursor)
+        idx = texto.lower().find(clave.lower(), desde)
         if idx < 0:
             continue
         encontrados.append((idx, titulo))
-        cursor = idx + len(clave)
+        desde = idx + len(clave)
     if not encontrados:
         return [("Texto", texto)]
     bloques = []
@@ -614,7 +614,7 @@ def paginas_a_markdown(paginas, nombre):
     partes = [
         "---",
         "documento: escritura de constitución de sociedad",
-        "uso: lectura por un modelo de lenguaje",
+        "uso: lectura del texto anonimizado",
         "anonimizado: true",
         "origen: OCR de un PDF escaneado",
         "etiquetas: <PERSON> persona; <LOCATION> lugar; <ORGANIZATION> organización; <AR_DNI> documento; <AR_CUIT> CUIT o CUIL; <PHONE_NUMBER> teléfono; <URL> web",
